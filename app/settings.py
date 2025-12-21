@@ -24,6 +24,7 @@ HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
 class EpicSettings(AgentConfig):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
+    # [基础配置] AiHubMix 必须使用 SecretStr 类型
     GEMINI_API_KEY: SecretStr | None = Field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY"),
         description="AiHubMix 的令牌",
@@ -64,7 +65,7 @@ settings = EpicSettings()
 settings.ignore_request_questions = ["Please drag the crossing to complete the lines"]
 
 # ==========================================
-# [修复版] AiHubMix 终极补丁 (自包含 helper 函数)
+# [方案一修复版] AiHubMix 终极补丁
 # ==========================================
 def _apply_aihubmix_patch():
     if not settings.GEMINI_API_KEY:
@@ -74,7 +75,7 @@ def _apply_aihubmix_patch():
         from google import genai
         from google.genai import types
         
-        # 1. 劫持 Client 初始化 (路径修正)
+        # 1. 劫持 Client 初始化 (自动修正中转路径)
         orig_init = genai.Client.__init__
         def new_init(self, *args, **kwargs):
             if hasattr(settings.GEMINI_API_KEY, 'get_secret_value'):
@@ -94,11 +95,11 @@ def _apply_aihubmix_patch():
         
         genai.Client.__init__ = new_init
 
-        # 2. 劫持文件上传 (绕过 400/403 错误)
+        # 2. 劫持文件上传 (绕过 400/403 错误，并修复 TypeError)
         try:
             file_cache = {}
 
-            # [关键修复] 自己定义 helper，不依赖 google 内部库
+            # 自定义 helper，避免依赖 google 内部库
             def _local_to_list(c):
                 return c if isinstance(c, list) else [c]
 
@@ -117,7 +118,6 @@ def _apply_aihubmix_patch():
 
             orig_generate = genai.models.AsyncModels.generate_content
             async def patched_generate(self_models, model, contents, **kwargs):
-                # 使用我们自己的 helper
                 normalized = _local_to_list(contents)
                 
                 for content in normalized:
@@ -128,11 +128,13 @@ def _apply_aihubmix_patch():
                                 data = file_cache[part.file_data.file_uri]
                                 content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
                 
-                return await orig_generate(self_models, model, normalized, **kwargs)
+                # [核心修复点] 强制使用关键字参数 model= 和 contents=
+                # 这解决了 "takes 1 positional argument but 3 were given" 的报错
+                return await orig_generate(self_models, model=model, contents=normalized, **kwargs)
 
             genai.files.AsyncFiles.upload = patched_upload
             genai.models.AsyncModels.generate_content = patched_generate
-            logger.info("🚀 Base64 文件绕过补丁加载成功 (独立版)")
+            logger.info("🚀 Base64 文件绕过补丁加载成功 (参数兼容版)")
             
         except Exception as ie:
             logger.warning(f"⚠️ 文件绕过补丁依然失败: {ie}")
