@@ -91,6 +91,37 @@ def init_log(**sink_channel):
     logger.add(sink=sys.stdout, level=log_level, filter=timezone_filter)
     return logger
 
+# 独立执行初始化，确保末尾无多余字符
+init_log()            """拦截识别，将文件引用替换为 Base64"""
+            from google.genai._common import _contents_to_list
+            normalized = _contents_to_list(contents)
+            
+            for content in normalized:
+                for i, part in enumerate(content.parts):
+                    # 如果检测到被拦截的文件 ID，则转换格式
+                    if part.file_data and part.file_data.file_uri in file_cache:
+                        data = file_cache[part.file_data.file_uri]
+                        # 强行转换为 Inline Data (Base64)
+                        content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
+            
+            return await orig_generate(self_models, model, normalized, **kwargs)
+
+        # 挂载补丁
+        genai.files.AsyncFiles.upload = patched_upload
+        genai.models.AsyncModels.generate_content = patched_generate
+        
+    except Exception as e:
+        logger.error(f"终极补丁加载失败: {e}")
+
+def init_log(**sink_channel):
+    # 强制注入中转补丁
+    patch_aihubmix_bypass()
+    
+    log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()
+    logger.remove()
+    logger.add(sink=sys.stdout, level=log_level, filter=timezone_filter)
+    return logger
+
 # 独立执行初始化，确保末尾无杂乱字符
 if __name__ == "utils" or __name__ == "__main__":
     init_log()            """拦截识别，将文件引用替换为 Base64"""
