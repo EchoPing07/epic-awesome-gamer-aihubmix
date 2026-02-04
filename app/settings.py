@@ -15,34 +15,26 @@ PROJECT_ROOT = Path(__file__).parent
 VOLUMES_DIR = PROJECT_ROOT.joinpath("volumes")
 LOG_DIR = VOLUMES_DIR.joinpath("logs")
 USER_DATA_DIR = VOLUMES_DIR.joinpath("user_data")
-RUNTIME_DIR = VOLUMES_DIR.joinpath("runtime")
-SCREENSHOTS_DIR = VOLUMES_DIR.joinpath("screenshots")
-RECORD_DIR = VOLUMES_DIR.joinpath("record")
 HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
 
 # === 配置类定义 ===
 class EpicSettings(AgentConfig):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
-    # [核心修正] 显式定义底层任务模型，强制同步环境变量 GEMINI_MODEL
-    # 这样修改后，底层识别逻辑才会真正使用你自定义的模型 ID
+    # [核心修正] 全部默认值强制改为你要求的 gemini-2.0-flash-free
     GEMINI_MODEL: str = Field(
-        default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-free"),
         description="模型名称",
     )
-    
-    # 强制覆盖底层库的 4 个细分任务模型变量
-    CHALLENGE_CLASSIFIER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
-    IMAGE_CLASSIFIER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
-    SPATIAL_POINT_REASONER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
-    SPATIAL_PATH_REASONER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    CHALLENGE_CLASSIFIER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-free"))
+    IMAGE_CLASSIFIER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-free"))
+    SPATIAL_POINT_REASONER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-free"))
+    SPATIAL_PATH_REASONER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-free"))
 
-    # [基础配置] AiHubMix 必须使用 SecretStr 类型
     GEMINI_API_KEY: SecretStr | None = Field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY"),
         description="AiHubMix 的令牌",
     )
-    
     GEMINI_BASE_URL: str = Field(
         default=os.getenv("GEMINI_BASE_URL", "https://aihubmix.com"),
         description="中转地址",
@@ -59,9 +51,6 @@ class EpicSettings(AgentConfig):
     ENABLE_APSCHEDULER: bool = Field(default=True)
     TASK_TIMEOUT_SECONDS: int = Field(default=900)
     REDIS_URL: str = Field(default="redis://redis:6379/0")
-    CELERY_WORKER_CONCURRENCY: int = Field(default=1)
-    CELERY_TASK_TIME_LIMIT: int = Field(default=1200)
-    CELERY_TASK_SOFT_TIME_LIMIT: int = Field(default=900)
 
     @property
     def user_data_dir(self) -> Path:
@@ -73,78 +62,61 @@ settings = EpicSettings()
 settings.ignore_request_questions = ["Please drag the crossing to complete the lines"]
 
 # ==========================================
-# [方案一修复版] AiHubMix 终极补丁
+# [AiHubMix 终极补丁 V3] 多图分辨率修复版
 # ==========================================
 def _apply_aihubmix_patch():
     if not settings.GEMINI_API_KEY:
         return
-
     try:
         from google import genai
         from google.genai import types
         
-        # 1. 劫持 Client 初始化 (自动修正中转路径)
+        # 1. 劫持初始化
         orig_init = genai.Client.__init__
         def new_init(self, *args, **kwargs):
-            if hasattr(settings.GEMINI_API_KEY, 'get_secret_value'):
-                api_key = settings.GEMINI_API_KEY.get_secret_value()
-            else:
-                api_key = str(settings.GEMINI_API_KEY)
-            
+            api_key = settings.GEMINI_API_KEY.get_secret_value() if hasattr(settings.GEMINI_API_KEY, 'get_secret_value') else str(settings.GEMINI_API_KEY)
             kwargs['api_key'] = api_key
-            
             base_url = settings.GEMINI_BASE_URL.rstrip('/')
             if base_url.endswith('/v1'): base_url = base_url[:-3]
             if not base_url.endswith('/gemini'): base_url = f"{base_url}/gemini"
-            
             kwargs['http_options'] = types.HttpOptions(base_url=base_url)
-            # 日志显示当前使用的最终模型
-            logger.info(f"🚀 AiHubMix 补丁已应用 | 使用模型: {settings.GEMINI_MODEL} | 地址: {base_url}")
+            logger.info(f"🚀 补丁生效 | 强制模型: {settings.GEMINI_MODEL}")
             orig_init(self, *args, **kwargs)
-        
         genai.Client.__init__ = new_init
 
-        # 2. 劫持文件上传 (绕过 400/403 错误，并修复 TypeError)
-        try:
-            file_cache = {}
+        # 2. 劫持生成逻辑 (按你说的，解决多图分辨率报错问题)
+        file_cache = {}
+        async def patched_upload(self_files, file, **kwargs):
+            if hasattr(file, 'read'): content = file.read()
+            elif isinstance(file, (str, Path)):
+                with open(file, 'rb') as f: content = f.read()
+            else: content = bytes(file)
+            if asyncio.iscoroutine(content): content = await content
+            file_id = f"bypass_{id(content)}"
+            file_cache[file_id] = content
+            return types.File(name=file_id, uri=file_id, mime_type="image/png")
 
-            def _local_to_list(c):
-                return c if isinstance(c, list) else [c]
+        orig_generate = genai.models.AsyncModels.generate_content
+        async def patched_generate(self_models, model, contents, **kwargs):
+            # [关键修复] 只要请求里带了 config，就强行把 media_resolution 删掉
+            # 这能彻底绕过“多张图片不准用高分辨率”的 400 报错
+            if 'config' in kwargs and kwargs['config'] is not None:
+                if hasattr(kwargs['config'], 'media_resolution'):
+                    kwargs['config'].media_resolution = None 
 
-            async def patched_upload(self_files, file, **kwargs):
-                if hasattr(file, 'read'): content = file.read()
-                elif isinstance(file, (str, Path)):
-                    with open(file, 'rb') as f: content = f.read()
-                else: content = bytes(file)
-                
-                if asyncio.iscoroutine(content): content = await content
-                
-                file_id = f"bypass_{id(content)}"
-                file_cache[file_id] = content
-                return types.File(name=file_id, uri=file_id, mime_type="image/png")
+            normalized = contents if isinstance(contents, list) else [contents]
+            for content in normalized:
+                if hasattr(content, 'parts'):
+                    for i, part in enumerate(content.parts):
+                        if part.file_data and part.file_data.file_uri in file_cache:
+                            data = file_cache[part.file_data.file_uri]
+                            content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
+            return await orig_generate(self_models, model=model, contents=normalized, **kwargs)
 
-            orig_generate = genai.models.AsyncModels.generate_content
-            async def patched_generate(self_models, model, contents, **kwargs):
-                normalized = _local_to_list(contents)
-                
-                for content in normalized:
-                    if hasattr(content, 'parts'):
-                        for i, part in enumerate(content.parts):
-                            if part.file_data and part.file_data.file_uri in file_cache:
-                                data = file_cache[part.file_data.file_uri]
-                                content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
-                
-                return await orig_generate(self_models, model=model, contents=normalized, **kwargs)
-
-            genai.files.AsyncFiles.upload = patched_upload
-            genai.models.AsyncModels.generate_content = patched_generate
-            logger.info("🚀 Base64 文件绕过补丁加载成功 (参数兼容版)")
-            
-        except Exception as ie:
-            logger.warning(f"⚠️ 文件绕过补丁失败: {ie}")
-
+        genai.files.AsyncFiles.upload = patched_upload
+        genai.models.AsyncModels.generate_content = patched_generate
+        logger.info("🚀 分辨率降写保护已加载。")
     except Exception as e:
-        logger.error(f"❌ 严重：AiHubMix 补丁加载失败! 原因: {e}")
+        logger.error(f"❌ 补丁异常: {e}")
 
-# 执行补丁
 _apply_aihubmix_patch()
