@@ -24,6 +24,19 @@ HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
 class EpicSettings(AgentConfig):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
+    # [核心修正] 显式定义底层任务模型，强制同步环境变量 GEMINI_MODEL
+    # 这样修改后，底层识别逻辑才会真正使用你自定义的模型 ID
+    GEMINI_MODEL: str = Field(
+        default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        description="模型名称",
+    )
+    
+    # 强制覆盖底层库的 4 个细分任务模型变量
+    CHALLENGE_CLASSIFIER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    IMAGE_CLASSIFIER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    SPATIAL_POINT_REASONER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    SPATIAL_PATH_REASONER_MODEL: str = Field(default=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+
     # [基础配置] AiHubMix 必须使用 SecretStr 类型
     GEMINI_API_KEY: SecretStr | None = Field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY"),
@@ -33,11 +46,6 @@ class EpicSettings(AgentConfig):
     GEMINI_BASE_URL: str = Field(
         default=os.getenv("GEMINI_BASE_URL", "https://aihubmix.com"),
         description="中转地址",
-    )
-    
-    GEMINI_MODEL: str = Field(
-        default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-free"),
-        description="模型名称",
     )
 
     EPIC_EMAIL: str = Field(default_factory=lambda: os.getenv("EPIC_EMAIL"))
@@ -90,7 +98,8 @@ def _apply_aihubmix_patch():
             if not base_url.endswith('/gemini'): base_url = f"{base_url}/gemini"
             
             kwargs['http_options'] = types.HttpOptions(base_url=base_url)
-            logger.info(f"🚀 AiHubMix 补丁已应用 | 模型: {settings.GEMINI_MODEL} | 地址: {base_url}")
+            # 日志显示当前使用的最终模型
+            logger.info(f"🚀 AiHubMix 补丁已应用 | 使用模型: {settings.GEMINI_MODEL} | 地址: {base_url}")
             orig_init(self, *args, **kwargs)
         
         genai.Client.__init__ = new_init
@@ -99,7 +108,6 @@ def _apply_aihubmix_patch():
         try:
             file_cache = {}
 
-            # 自定义 helper，避免依赖 google 内部库
             def _local_to_list(c):
                 return c if isinstance(c, list) else [c]
 
@@ -111,7 +119,6 @@ def _apply_aihubmix_patch():
                 
                 if asyncio.iscoroutine(content): content = await content
                 
-                # 伪造文件上传，实际只存内存
                 file_id = f"bypass_{id(content)}"
                 file_cache[file_id] = content
                 return types.File(name=file_id, uri=file_id, mime_type="image/png")
@@ -123,13 +130,10 @@ def _apply_aihubmix_patch():
                 for content in normalized:
                     if hasattr(content, 'parts'):
                         for i, part in enumerate(content.parts):
-                            # 如果发现是我们伪造的文件 ID，立马替换成 Base64
                             if part.file_data and part.file_data.file_uri in file_cache:
                                 data = file_cache[part.file_data.file_uri]
                                 content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
                 
-                # [核心修复点] 强制使用关键字参数 model= 和 contents=
-                # 这解决了 "takes 1 positional argument but 3 were given" 的报错
                 return await orig_generate(self_models, model=model, contents=normalized, **kwargs)
 
             genai.files.AsyncFiles.upload = patched_upload
@@ -137,10 +141,10 @@ def _apply_aihubmix_patch():
             logger.info("🚀 Base64 文件绕过补丁加载成功 (参数兼容版)")
             
         except Exception as ie:
-            logger.warning(f"⚠️ 文件绕过补丁依然失败: {ie}")
+            logger.warning(f"⚠️ 文件绕过补丁失败: {ie}")
 
     except Exception as e:
-        logger.error(f"❌ 严重：AiHubMix 补丁加载完全失败! 原因: {e}")
+        logger.error(f"❌ 严重：AiHubMix 补丁加载失败! 原因: {e}")
 
 # 执行补丁
 _apply_aihubmix_patch()
